@@ -2,91 +2,113 @@
 
 ## Goal
 
-Add to the existing extension, without changing existing behavior:
+Subagents never block the parent. Results are injected into the parent's chat when they're ready.
 
-1. **Notify:** when a subagent finishes, the parent is told automatically. No blocking `wait`.
-2. **Own:** a pi session sees and controls only its own subagents. A subagent can't control or message anyone.
+Also: a parent only sees and controls its own subagents.
 
 Not doing: subagent↔subagent messaging, revive, a sandbox.
 
 ## Workflow
 
 ```
-parent: subagent spawn ...      → returns immediately (unchanged)
-parent: keeps working / chatting
-child:  finishes
-parent: gets "Subagent X finished: <answer>"   ← new
-        idle → reacts right away · busy → after its current turn
-parent: subagent stop X                        (unchanged)
+agent:  subagent spawn ...        → returns immediately
+agent:  keeps working, or ends its turn; user keeps chatting
+child:  finishes a turn           → writes outbox/<seq>.json
+parent ext (1 s poll):            → reads outbox, injects into parent chat, deletes file
+agent:  gets "Subagent X finished: <answer>" and reacts
+          idle → new turn right away · busy → after its current turn
+agent:  subagent send X ...       (optional follow-up; result arrives the same way)
+agent:  subagent stop X
 ```
 
-## Existing behavior: unchanged
+## Design
 
-Everything below works exactly as today:
+### Outbox (child → parent)
 
-- All commands, flags, output text and exit codes.
-- Spawn/stop/wait/send/rename/status/list from inside pi.
-- Spawn and manage from a plain terminal.
-- `wait` blocks and prints the final answer.
-- Widget, `/subagent` attach, suspend on quit, relaunch on resume, `/reload`.
-- Run folder layout, metadata, inbox.
-- Children can't spawn subagents.
+- Child extension writes `runDir/outbox/<seq>-<ts>.json` on:
+  - `agent_settled` with child idle → `finished` / `failed` (from stopReason)
+  - transition to `error` → `failed`
+  - `session_shutdown` with reason `quit` → `exited`
+- Record: `{ handle, name, seq, kind, stopReason, text, errorMessage?, at }`.
+- Text comes from `ctx.sessionManager.getBranch()` (last assistant message), not from re-parsing `session.jsonl`.
+- Written tmp + rename, like the inbox. One writer (child), one reader (parent).
+- A crash with no `session_shutdown` is detected by the parent instead: tmux gone, not suspended, no stop marker → parent injects `exited` itself.
 
-Only exceptions, all from the two goals:
+### Parent watcher
 
-| Change | Before | After |
-|---|---|---|
-| New message after a child finishes | none | `subagent-result` message (turn off: `PI_SUBAGENT_NOTIFY=0`) |
-| pi session uses another session's handle | allowed | `Unknown subagent` |
-| `subagent` inside a child | only `spawn` refused | all commands refused |
-| Child runs `tmux` | your tmux server | its own empty one |
-| Child file tools on other subagents' folders | allowed | blocked |
+- Runs whenever the session runs, **not** gated on `hasUI`.
+- Every 1 s: for each run with `parentSessionId == this session`, read `outbox/*.json` in order.
+- All records found in one tick → **one** `pi.sendMessage({ customType: "subagent_result", display: true, ... }, { triggerTurn: true, deliverAs: "followUp" })`.
+- Unlink each file **after** `sendMessage`. A parent crash between the two can duplicate a result; it never loses one.
+- Each subagent's files are handled in their own try/catch; a run that vanishes is skipped.
+- A message renderer for `subagent_result`.
 
-## Who can do what
+### Lifecycle
+
+- Suspend/quit: the outbox stays on disk. Resume: the watcher drains it, so results produced before the quit are delivered.
+- `/reload`: watcher torn down and recreated; nothing lost.
+- `stop`: removes the run dir, so no stale results.
+- Intentional stop: `stop` and suspend write a `stopping` file before killing, so the parent doesn't report them as a crash.
+
+### Ownership
 
 | Caller | Detected by | Can |
 |---|---|---|
-| pi session | `PI_SESSION_ID` set | spawn; manage its own subagents |
-| Child | `PI_SUBAGENT_RUN_DIR` set | nothing |
-| Plain terminal, `!` commands | neither set | everything (as today) |
+| pi session | `PI_SESSION_ID` | spawn; manage its own subagents |
+| Child | `PI_SUBAGENT_RUN_DIR` | nothing |
+| Plain terminal, `!` commands | neither | everything (as today) |
 
-## Notifications
+Another session's handle → `Unknown subagent` (same as a missing handle).
 
-- Sent for: **finished**, **failed**, **exited** (crashed or killed, not `stop`).
-- Each result is sent **at most once**: never twice, even with two pi windows on one session.
-  - Rarely it's sent **zero** times: you quit or press Esc while it's queued. Get it with `subagent wait`.
-- Sent once the result has been seen on 2 checks in a row (1 s apart).
-- Rename doesn't resend. Resume doesn't resend old results.
-- `wait` is unchanged. If its result was already notified, it adds a note line on **stderr** (stdout stays the same).
-- Long answers cut at 20k chars; `wait` still has the full text.
+### Child guardrails (not a sandbox)
 
-## Child restrictions
+- The `subagent` command refuses in a child.
+- The child gets a private tmux server (`TMUX_TMPDIR=runDir/tmux`).
+- File tools can't touch other runs' folders, and can't write anywhere in `subagents/`.
+- Bash isn't restricted. The docs say so.
 
-Guardrails against mistakes, not a sandbox.
+## CLI changes
 
-- The child's own logs and data are written by pi and the extension directly, not by the model's tools, so they are unaffected.
-- Blocked: the model's `read`/`write`/`edit`/`grep`/`find`/`ls` on other subagents' folders, and `write`/`edit` anywhere in `~/.pi/agent/subagents/`.
-- Not blocked: bash. `echo x > <other subagent's file>` still works. A real fix is a bubblewrap sandbox per child (later, opt-in).
-- Normal work (grep, editing repo files, heredocs) is unaffected.
+| Command | Change |
+|---|---|
+| `spawn` | Output: `Spawned X` + `You'll be notified when it finishes.` + attach line |
+| `result <handle>` | **New.** Non-blocking: prints the last answer or `X is still running`. |
+| `wait` | **OPEN-1** |
+| `status`/`send`/`rename`/`stop` | Ownership-scoped |
+| all | Refused inside a child |
 
-## Implementation notes
+Everything else stays as today (flags, `list`, widget, `/subagent`, suspend/resume).
 
-- **Result IDs:** finished/failed = assistant entry id; error = entry id + sha256(error); exit = per-launch id.
-- **Send once:** the sender creates `claims/<sha256(id)>` with exclusive create; only the creator sends.
-- **Intentional stop:** `stop`/suspend writes `stopping` = current launch id before killing. A marker from an old launch is ignored.
-- **Check loop:** each subagent checked in its own try/catch; a vanished folder is skipped.
-- New files in the run folder: `claims/`, `stopping`, `tmux/`. New metadata field: `launchId`. Old runs without them still work.
+## Skill changes
+
+- After `spawn`, hand control back. **Don't call `wait`.** The result arrives as a `subagent_result` message; respond then.
+- Use `subagent result X` to check on demand.
+- Remove the "bash timeout above 1800 s" line.
+
+## Upstream bugs fixed in this branch
+
+These would make the parent never hear back:
+
+- **Inbox drops messages.** Two messages drained together while the child is idle lose the second. Fix: always pass `deliverAs`, and don't decide based on `isIdle()` when messages arrive back-to-back.
+- **Lost metadata writes.** Parent, child and CLI all rewrite the whole `metadata.json`. Fix: new facts (`stopping`, outbox) go in separate files; nothing new is added to metadata.
+
+Other upstream bugs (from the Astra/Fable reviews) stay as they are.
 
 ## Tests
 
-- **Regression:** a script runs every existing command and flow against `main` and the new branch, then compares output. Must match except for the table above.
-- **New:** one test per bullet in Notifications and Child restrictions.
-- End-to-end: real parent pi in tmux.
+- **Regression:** run every existing command and flow against `main` and the branch; output must match, except for the CLI changes above.
+- **Unit (fake run folders):** outbox write/read/order, batching, unlink after send, vanished run, ownership, child refusal.
+- **Live (real parent pi in tmux):**
+  - spawn → parent ends turn → result arrives
+  - parent busy → arrives after its turn
+  - quit with a pending result → resume → delivered
+  - crash → `exited`
+  - `stop` → nothing reported
 
 ## Decisions needed
 
 | # | Question | Proposed |
 |---|---|---|
-| 1 | Child gets a private tmux server | Yes |
-| 2 | Block a child's `grep -r ~/.pi/agent`? | Only that folder and `subagents/`; wider searches allowed |
-| 3 | Bubblewrap sandbox for children | Later, opt-in, separate change |
+| 1 | `wait`: remove it, or keep it for users only? | Keep it as-is for plain terminals and scripts; the skill tells the agent not to use it |
+| 2 | Results that arrive unprompted start a turn, which costs tokens. Add a setting? | `PI_SUBAGENT_NOTIFY=0` → inject without `triggerTurn` (appears in chat, no new turn) |
+| 3 | Register a `spawn_subagent` tool instead of the CLI? | Later |
