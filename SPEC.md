@@ -6,7 +6,7 @@ Subagents never block the parent. Results are injected into the parent's chat wh
 
 Also: a parent only sees and controls its own subagents.
 
-Not doing: subagent↔subagent messaging, revive, a sandbox.
+Not doing: revive, a sandbox, restricting what subagents can do.
 
 ## Workflow
 
@@ -55,27 +55,21 @@ agent:  subagent stop X
 | Caller | Detected by | Can |
 |---|---|---|
 | pi session | `PI_SESSION_ID` | spawn; manage its own subagents |
-| Child | `PI_SUBAGENT_RUN_DIR` | nothing |
+| Child | `PI_SUBAGENT_RUN_DIR` | everything except spawn (as today) |
 | Plain terminal, `!` commands | neither | everything (as today) |
 
 Another session's handle → `Unknown subagent` (same as a missing handle).
 
-### Child guardrails (not a sandbox)
-
-- The `subagent` command refuses in a child.
-- The child gets a private tmux server (`TMUX_TMPDIR=runDir/tmux`).
-- File tools can't touch other runs' folders, and can't write anywhere in `subagents/`.
-- Bash isn't restricted. The docs say so.
+Children are exempt from this check. A child's bash has its own `PI_SESSION_ID`, so without the exemption it would lose the access it has today.
 
 ## CLI changes
 
 | Command | Change |
 |---|---|
-| `spawn` | Output: `Spawned X` + `You'll be notified when it finishes.` + attach line |
+| `spawn` | Output unchanged, plus one new line: `You'll be notified when it finishes.` |
 | `result <handle>` | **New.** Non-blocking: prints the last answer or `X is still running`. |
 | `wait` | **OPEN-1** |
-| `status`/`send`/`rename`/`stop` | Ownership-scoped |
-| all | Refused inside a child |
+| `status`/`send`/`rename`/`stop` | Ownership-scoped for pi sessions; children unchanged |
 
 Everything else stays as today (flags, `list`, widget, `/subagent`, suspend/resume).
 
@@ -97,7 +91,7 @@ Other upstream bugs (from the Astra/Fable reviews) stay as they are.
 ## Tests
 
 - **Regression:** run every existing command and flow against `main` and the branch; output must match, except for the CLI changes above.
-- **Unit (fake run folders):** outbox write/read/order, batching, unlink after send, vanished run, ownership, child refusal.
+- **Unit (fake run folders):** outbox write/read/order, batching, unlink after send, vanished run, ownership, child keeps today's access.
 - **Live (real parent pi in tmux):**
   - spawn → parent ends turn → result arrives
   - parent busy → arrives after its turn
