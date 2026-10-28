@@ -2,71 +2,91 @@
 
 ## Goal
 
-1. **Notify:** when a subagent finishes, the parent is told automatically. No blocking `wait`.
-2. **Own:** a parent sees and controls only its own subagents. A subagent can't control or message anyone.
+Add to the existing extension, without changing existing behavior:
 
-Not doing: subagent↔subagent messaging, revive, a real sandbox.
+1. **Notify:** when a subagent finishes, the parent is told automatically. No blocking `wait`.
+2. **Own:** a pi session sees and controls only its own subagents. A subagent can't control or message anyone.
+
+Not doing: subagent↔subagent messaging, revive, a sandbox.
 
 ## Workflow
 
 ```
-parent: subagent spawn ...      → returns immediately
+parent: subagent spawn ...      → returns immediately (unchanged)
 parent: keeps working / chatting
 child:  finishes
-parent: gets "Subagent X finished: <answer>" as a message
+parent: gets "Subagent X finished: <answer>"   ← new
         idle → reacts right away · busy → after its current turn
-parent: subagent stop X
+parent: subagent stop X                        (unchanged)
 ```
+
+## Existing behavior: unchanged
+
+Everything below works exactly as today:
+
+- All commands, flags, output text and exit codes.
+- Spawn/stop/wait/send/rename/status/list from inside pi.
+- Spawn and manage from a plain terminal.
+- `wait` blocks and prints the final answer.
+- Widget, `/subagent` attach, suspend on quit, relaunch on resume, `/reload`.
+- Run folder layout, metadata, inbox.
+- Children can't spawn subagents.
+
+Only exceptions, all from the two goals:
+
+| Change | Before | After |
+|---|---|---|
+| New message after a child finishes | none | `subagent-result` message (turn off: `PI_SUBAGENT_NOTIFY=0`) |
+| pi session uses another session's handle | allowed | `Unknown subagent` |
+| `subagent` inside a child | only `spawn` refused | all commands refused |
+| Child runs `tmux` | your tmux server | its own empty one |
+| Child file tools on other subagents' folders | allowed | blocked |
 
 ## Who can do what
 
-| Caller | How it's detected | Can |
+| Caller | Detected by | Can |
 |---|---|---|
-| Parent | `PI_SESSION_ID` set | spawn; manage its own subagents |
+| pi session | `PI_SESSION_ID` set | spawn; manage its own subagents |
 | Child | `PI_SUBAGENT_RUN_DIR` set | nothing |
-| Operator (you, plain terminal) | `subagent --operator ...` | manage any subagent; not spawn |
-| Anything else | | nothing |
-
-- Another session's subagent → `Unknown subagent` (same as nonexistent).
-- `--operator` only counts as the first argument.
-- `!` commands in pi count as plain terminal → need `--operator`.
+| Plain terminal, `!` commands | neither set | everything (as today) |
 
 ## Notifications
 
-- Sent for: **finished**, **failed**, **exited** (crashed / killed, not `stop`).
-- Each result is sent **once at most**. Never twice, even with two pi windows on one session.
+- Sent for: **finished**, **failed**, **exited** (crashed or killed, not `stop`).
+- Each result is sent **at most once**: never twice, even with two pi windows on one session.
   - Rarely it's sent **zero** times: you quit or press Esc while it's queued. Get it with `subagent wait`.
-- Sent after the result is seen on 2 checks in a row (1 s apart), so a brief idle doesn't trigger it.
-- Rename doesn't resend. Resuming a session doesn't resend old results.
-- If you `wait` on a result that was already notified, `wait` still prints it, with a note.
-- Long answers are cut at 20k chars; `wait` has the full text.
-- `PI_SUBAGENT_NOTIFY=0` turns it off.
+- Sent once the result has been seen on 2 checks in a row (1 s apart).
+- Rename doesn't resend. Resume doesn't resend old results.
+- `wait` is unchanged. If its result was already notified, it adds a note line on **stderr** (stdout stays the same).
+- Long answers cut at 20k chars; `wait` still has the full text.
 
 ## Child restrictions
 
-Guardrails against mistakes, not a sandbox. A child that deliberately tries can get around them.
+Guardrails against mistakes, not a sandbox.
 
-- `subagent` command refuses to run inside a child.
-- Child gets its own private tmux server, so it can't touch yours.
-- File tools can't read other subagents' folders or write anywhere in `~/.pi/agent/subagents/`.
-- Normal work (grep, editing repo files, heredocs) is not affected.
+- The child's own logs and data are written by pi and the extension directly, not by the model's tools, so they are unaffected.
+- Blocked: the model's `read`/`write`/`edit`/`grep`/`find`/`ls` on other subagents' folders, and `write`/`edit` anywhere in `~/.pi/agent/subagents/`.
+- Not blocked: bash. `echo x > <other subagent's file>` still works. A real fix is a bubblewrap sandbox per child (later, opt-in).
+- Normal work (grep, editing repo files, heredocs) is unaffected.
 
-## How it works (implementation notes)
+## Implementation notes
 
-- **Result IDs:** finished/failed = assistant entry id; error = entry id + hash of error; exit = per-launch id.
+- **Result IDs:** finished/failed = assistant entry id; error = entry id + sha256(error); exit = per-launch id.
 - **Send once:** the sender creates `claims/<sha256(id)>` with exclusive create; only the creator sends.
-- **Intentional stop:** `stop` / suspend writes `stopping` = current launch id before killing. A stale marker from an old launch is ignored.
+- **Intentional stop:** `stop`/suspend writes `stopping` = current launch id before killing. A marker from an old launch is ignored.
 - **Check loop:** each subagent checked in its own try/catch; a vanished folder is skipped.
+- New files in the run folder: `claims/`, `stopping`, `tmux/`. New metadata field: `launchId`. Old runs without them still work.
 
 ## Tests
 
-Every bullet above gets a test. Fake run folders for logic; a real parent pi in tmux for end-to-end.
+- **Regression:** a script runs every existing command and flow against `main` and the new branch, then compares output. Must match except for the table above.
+- **New:** one test per bullet in Notifications and Child restrictions.
+- End-to-end: real parent pi in tmux.
 
 ## Decisions needed
 
 | # | Question | Proposed |
 |---|---|---|
-| 1 | Can operator spawn? | No |
-| 2 | `wait` on an already-notified result | Print it with a note |
-| 3 | Child gets a private tmux server | Yes |
-| 4 | Block `grep -r ~/.pi/agent` from a child? | Yes, only that folder and `~/.pi/agent/subagents/`; wider searches allowed |
+| 1 | Child gets a private tmux server | Yes |
+| 2 | Block a child's `grep -r ~/.pi/agent`? | Only that folder and `subagents/`; wider searches allowed |
+| 3 | Bubblewrap sandbox for children | Later, opt-in, separate change |
