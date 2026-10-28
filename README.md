@@ -65,6 +65,7 @@ subagent send a1b2c3 "Focus on error handling"
 subagent send a1b2c3 --follow-up "Then summarize"
 subagent wait a1b2c3
 subagent stop a1b2c3
+subagent revive a1b2c3
 subagent list
 ```
 
@@ -80,4 +81,21 @@ Optional spawn flags:
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files
 
-Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` archives a run; `subagent stop --purge` removes it permanently.
+
+## Archive and revive
+
+`subagent stop` moves the run directory, including the full `session.jsonl` transcript, to `~/.pi/agent/subagents-archive/<handle>-<timestamp>/` instead of deleting it. Children that crashed or were killed are archived the same way when the parent session quits. Runs that never wrote a transcript are removed.
+
+```sh
+subagent list --archived                 # archived runs, newest first
+subagent revive a1b2c3                   # relaunch idle with full history
+subagent revive a1b2c3 --prompt "Continue"
+subagent stop a1b2c3 --purge             # delete instead of archiving
+subagent spawn --from-session /path/to/session.jsonl --prompt "Continue"
+```
+
+- `revive` works for archived runs and for live runs whose process exited or failed. It keeps the handle, name, model, thinking level, tools, isolation flags, and working directory, and adopts the run into the calling parent session. Messages still queued in the inbox when a run was archived are discarded.
+- `--from-session` starts a new run from a copy of any pi session transcript. It uses the transcript's recorded working directory unless `--cwd` is given.
+- Archived handles are never reused for new subagents.
+- Set `PI_SUBAGENT_ARCHIVE=0` to restore delete-on-stop behavior. The archive is not pruned automatically.

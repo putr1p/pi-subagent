@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	archiveRunDir,
 	assistantText,
 	effectiveRunState,
+	findArchivedRuns,
 	getRunsDir,
 	inboxDir,
 	launchRun,
@@ -36,13 +38,15 @@ function usage(): never {
 	fail(`Usage:
   subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
     [--cwd <dir>] [--tools <names>] [--no-extensions] [--no-skills]
-    [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
+    [--no-prompt-templates] [--no-context-files] [--from-session <session.jsonl>]
+    (--prompt <text> | --file <path>)...
+  subagent revive <handle> [--prompt <text>]...
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
   subagent wait <handle> [--timeout <seconds>]
-  subagent stop <handle>
-  subagent list`);
+  subagent stop <handle> [--purge]
+  subagent list [--archived]`);
 }
 
 function valueAfter(args: string[], index: number, option: string): string {
@@ -72,7 +76,8 @@ function generateHandle(): string {
 	mkdirSync(getRunsDir(), { recursive: true, mode: 0o700 });
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const handle = randomBytes(3).toString("hex");
-		if (!existsSync(runDirForHandle(handle))) return handle;
+		// Archived runs keep their handle so they can be revived; never reuse one.
+		if (!existsSync(runDirForHandle(handle)) && findArchivedRuns(handle).length === 0) return handle;
 	}
 	fail("Could not allocate a unique subagent handle");
 }
@@ -89,6 +94,8 @@ function spawnSubagent(args: string[]): void {
 	let noSkills = false;
 	let noPromptTemplates = false;
 	let noContextFiles = false;
+	let fromSession: string | undefined;
+	let cwdGiven = false;
 	const prompts: string[] = [];
 	const files: string[] = [];
 
@@ -113,8 +120,16 @@ function spawnSubagent(args: string[]): void {
 				break;
 			case "--cwd":
 				cwd = resolve(valueAfter(args, i, arg));
+				cwdGiven = true;
 				i++;
 				break;
+			case "--from-session": {
+				const file = resolve(valueAfter(args, i, arg));
+				if (!existsSync(file)) fail(`Session file not found: ${file}`);
+				fromSession = file;
+				i++;
+				break;
+			}
 			case "--tools":
 				tools = valueAfter(args, i, arg);
 				i++;
@@ -152,7 +167,13 @@ function spawnSubagent(args: string[]): void {
 	if (!VALID_THINKING_LEVELS.has(thinking)) fail(`Invalid thinking level: ${thinking}`);
 	if (tools !== undefined && !tools.split(",").some((name) => name.trim()))
 		fail("--tools requires at least one tool name");
-	if (prompts.length === 0 && files.length === 0) fail("spawn requires at least one --prompt or --file");
+	if (prompts.length === 0 && files.length === 0 && !fromSession)
+		fail("spawn requires at least one --prompt or --file, or --from-session");
+	if (fromSession && !cwdGiven) {
+		// Continue in the directory the original session ran in when it still exists.
+		const headerCwd = sessionHeaderCwd(fromSession);
+		if (headerCwd && existsSync(headerCwd)) cwd = headerCwd;
+	}
 	if (!existsSync(cwd)) fail(`Working directory not found: ${cwd}`);
 
 	const handle = generateHandle();
@@ -160,7 +181,8 @@ function spawnSubagent(args: string[]): void {
 	const sessionFile = join(runDir, "session.jsonl");
 	const tmuxSession = `pi-subagent-${handle}`;
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
-	writeFileSync(sessionFile, "", { mode: 0o600 });
+	if (fromSession) copyFileSync(fromSession, sessionFile);
+	else writeFileSync(sessionFile, "", { mode: 0o600 });
 
 	const launchArgs: string[] = [];
 	if (tools) launchArgs.push("--tools", tools);
@@ -200,7 +222,90 @@ function spawnSubagent(args: string[]): void {
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	const initialState = initialArgs.length > 0 ? "busy" : "idle (history restored)";
+	process.stdout.write(
+		`Spawned ${runDisplayName(metadata)}\nState: ${initialState}\nAttach: tmux attach -t ${tmuxSession}\n`,
+	);
+}
+
+/** The working directory recorded in a pi session header, if readable. */
+function sessionHeaderCwd(sessionFile: string): string | undefined {
+	try {
+		const firstLine = readFileSync(sessionFile, "utf8").split("\n", 1)[0];
+		const header: unknown = JSON.parse(firstLine);
+		if (typeof header !== "object" || header === null) return undefined;
+		const cwd = (header as Record<string, unknown>).cwd;
+		return typeof cwd === "string" ? cwd : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function parsePrompts(args: string[], command: string): string[] {
+	const prompts: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] !== "--prompt") fail(`Unknown ${command} argument: ${args[i]}`);
+		prompts.push(valueAfter(args, i, "--prompt"));
+		i++;
+	}
+	return prompts;
+}
+
+/**
+ * Relaunch a run that is no longer running, keeping its full history. Live runs that exited or
+ * failed are relaunched in place; stopped runs are restored from the archive. The revived run is
+ * adopted by the calling parent session.
+ */
+function reviveSubagent(args: string[]): void {
+	if (process.env.PI_SUBAGENT_RUN_DIR) fail("Nested subagents are disabled");
+	const handle = args.shift();
+	if (!handle) usage();
+	const prompts = parsePrompts(args, "revive");
+	const handleOnly = handle.replace(/-.*$/, "");
+	if (!/^[a-z0-9]+$/.test(handleOnly)) fail(`Invalid subagent handle: ${handle}`);
+	const runDir = runDirForHandle(handleOnly);
+
+	let metadata = readMetadata(runDir);
+	if (metadata && handle !== handleOnly) fail(`${handleOnly} is active; revive it by handle`);
+	if (metadata) {
+		if (tmuxSessionExists(metadata.tmuxSession)) fail(`${handleOnly} is already running`);
+	} else {
+		const archived = findArchivedRuns(handle)[0];
+		if (!archived) fail(`No active or archived subagent: ${handle}`);
+		if (!existsSync(archived.sessionFile)) fail(`Archived transcript missing: ${archived.sessionFile}`);
+		renameSync(archived.runDir, runDir);
+		writeMetadata({
+			...archived,
+			runDir,
+			sessionFile: join(runDir, "session.jsonl"),
+			archivedAt: undefined,
+			updatedAt: new Date().toISOString(),
+		});
+		metadata = readMetadata(runDir);
+		if (!metadata) fail(`Could not restore ${handle}`);
+	}
+
+	if (!existsSync(metadata.cwd)) fail(`Working directory not found: ${metadata.cwd}`);
+	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
+	const starting = updateMetadata(runDir, {
+		parentSessionId: process.env.PI_SESSION_ID || metadata.parentSessionId,
+		parentSessionFile: process.env.PI_SESSION_FILE || metadata.parentSessionFile,
+		state: "starting",
+		suspended: undefined,
+		error: undefined,
+	});
+	if (!starting) fail(`Could not update ${handleOnly}`);
+	const initialArgs = prompts.length > 0 ? [`Task:\n${prompts.join("\n\n")}`] : [];
+	try {
+		launchRun(starting, initialArgs);
+	} catch (error) {
+		updateMetadata(runDir, { state: "error", error: error instanceof Error ? error.message : String(error) });
+		throw error;
+	}
+	const initialState = initialArgs.length > 0 ? "busy" : "idle (history restored)";
+	process.stdout.write(
+		`Revived ${runDisplayName(starting)}\nState: ${initialState}\nAttach: tmux attach -t ${starting.tmuxSession}\n`,
+	);
 }
 
 function statusSubagent(args: string[]): void {
@@ -284,16 +389,41 @@ async function waitSubagent(args: string[]): Promise<void> {
 }
 
 async function stopSubagent(args: string[]): Promise<void> {
-	if (args.length !== 1) usage();
-	const metadata = getRun(args[0]);
+	const purge = args.includes("--purge");
+	const rest = args.filter((arg) => arg !== "--purge");
+	if (rest.length !== 1) usage();
+	const metadata = getRun(rest[0]);
 	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
 	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
-	removeRunDir(metadata.runDir);
-	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	if (purge) {
+		removeRunDir(metadata.runDir);
+		process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+		return;
+	}
+	const archived = archiveRunDir(metadata.runDir);
+	process.stdout.write(
+		archived
+			? `Stopped ${runDisplayName(metadata)}\nArchived: ${archived}\nRevive: subagent revive ${metadata.handle}\n`
+			: `Stopped ${runDisplayName(metadata)}\n`,
+	);
 }
 
 function listSubagents(args: string[]): void {
+	if (args.length === 1 && args[0] === "--archived") {
+		const archived = findArchivedRuns();
+		if (archived.length === 0) {
+			process.stdout.write("No archived subagents\n");
+			return;
+		}
+		for (const metadata of archived) {
+			const id = metadata.runDir.split("/").at(-1) ?? metadata.handle;
+			process.stdout.write(
+				`${metadata.name ? `${metadata.name} ` : ""}(${id})  archived ${metadata.archivedAt ?? metadata.updatedAt}  ${metadata.provider}/${metadata.model}  ${metadata.cwd}\n`,
+			);
+		}
+		return;
+	}
 	if (args.length !== 0) usage();
 	const runs = listRuns(process.env.PI_SESSION_ID || undefined);
 	if (runs.length === 0) {
@@ -313,6 +443,9 @@ async function main(): Promise<void> {
 	switch (command) {
 		case "spawn":
 			spawnSubagent(args);
+			break;
+		case "revive":
+			reviveSubagent(args);
 			break;
 		case "status":
 			statusSubagent(args);

@@ -2,12 +2,14 @@ import { spawnSync } from "node:child_process";
 import {
 	accessSync,
 	constants,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -31,6 +33,8 @@ export interface RunMetadata {
 	thinking: string;
 	/** Extra pi CLI flags (tools, isolation) reused when the run is relaunched. */
 	launchArgs?: string[];
+	/** Set when the run directory is moved to the archive by `subagent stop` or parent cleanup. */
+	archivedAt?: string;
 	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
 	suspended?: boolean;
 	state: RunState;
@@ -70,6 +74,16 @@ export function getAgentDir(): string {
 
 export function getRunsDir(): string {
 	return join(getAgentDir(), "subagents");
+}
+
+/** Stopped and crashed runs are moved here instead of being deleted, so they can be revived. */
+export function getArchiveDir(): string {
+	return join(getAgentDir(), "subagents-archive");
+}
+
+export function archiveEnabled(): boolean {
+	const value = process.env.PI_SUBAGENT_ARCHIVE?.trim().toLowerCase();
+	return !(value === "0" || value === "off" || value === "false" || value === "no");
 }
 
 export function metadataPath(runDir: string): string {
@@ -149,6 +163,59 @@ export async function waitForRunShutdown(runDir: string, timeoutMs = 2000): Prom
 
 export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}
+
+function hasTranscript(runDir: string): boolean {
+	try {
+		return statSync(join(runDir, "session.jsonl")).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Move a finished run into the archive so it can be revived later. Runs without a transcript are
+ * removed. Falls back to removal when archiving is disabled. Returns the archive path, if any.
+ */
+export function archiveRunDir(runDir: string): string | undefined {
+	const metadata = readMetadata(runDir);
+	if (!metadata || !archiveEnabled() || !hasTranscript(runDir)) {
+		removeRunDir(runDir);
+		return undefined;
+	}
+	const now = new Date();
+	updateMetadata(runDir, { state: "exited", suspended: undefined, archivedAt: now.toISOString() });
+	// Pending inbox messages were never delivered and must not be replayed on revive.
+	rmSync(inboxDir(runDir), { recursive: true, force: true });
+	const root = getArchiveDir();
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\..*$/, "");
+	let target = join(root, `${metadata.handle}-${stamp}`);
+	for (let attempt = 1; existsSync(target); attempt++) target = join(root, `${metadata.handle}-${stamp}-${attempt}`);
+	try {
+		renameSync(runDir, target);
+	} catch {
+		// Cross-device or permission problem: keep the data rather than deleting it.
+		cpSync(runDir, target, { recursive: true });
+		removeRunDir(runDir);
+	}
+	return target;
+}
+
+/** Archived run directories for a handle, newest first. */
+export function findArchivedRuns(handle?: string): RunMetadata[] {
+	const root = getArchiveDir();
+	if (!existsSync(root)) return [];
+	const runs: RunMetadata[] = [];
+	for (const entry of readdirSync(root, { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		if (handle && entry.name !== handle && !entry.name.startsWith(`${handle}-`)) continue;
+		const metadata = readMetadata(join(root, entry.name));
+		if (!metadata) continue;
+		// The stored runDir points at the original location; report where the archive actually is.
+		runs.push({ ...metadata, runDir: join(root, entry.name), sessionFile: join(root, entry.name, "session.jsonl") });
+	}
+	return runs.sort((a, b) => (b.archivedAt ?? b.updatedAt).localeCompare(a.archivedAt ?? a.updatedAt));
 }
 
 export function tmuxSessionExists(session: string): boolean {

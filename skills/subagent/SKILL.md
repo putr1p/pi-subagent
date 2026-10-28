@@ -88,6 +88,22 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and moves the run transcript and metadata to `~/.pi/agent/subagents-archive/`, so stopping does not lose work. Use `subagent stop <handle> --purge` only when the transcript should be deleted. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+
+## Revive
+
+```sh
+# Relaunch a stopped (archived), crashed, or exited subagent with its full history.
+subagent revive <handle>
+subagent revive <handle> --prompt "Continue with the next step"
+
+# List archived subagents.
+subagent list --archived
+
+# Start a new subagent that continues from any pi session transcript.
+subagent spawn --name resumed --from-session /path/to/session.jsonl --prompt "Continue"
+```
+
+`revive` keeps the original handle, name, model, tools, isolation flags, and working directory, and adopts the run into the current session. Without `--prompt` it starts idle; use `send` to give it work. `--from-session` copies the transcript into a new run with a new handle, uses the transcript's recorded working directory unless `--cwd` is given, and may be used without `--prompt`.
 
 The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.

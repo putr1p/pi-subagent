@@ -11,6 +11,7 @@ import {
 	listRuns,
 	readMetadata,
 	removeRunDir,
+	archiveRunDir,
 	runDisplayName,
 	type InboxMessage,
 	type RunMetadata,
@@ -181,7 +182,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// session relaunches them. Children that already exited on their own are discarded.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
 				if (!tmuxSessionExists(run.tmuxSession)) {
-					if (!run.suspended) removeRunDir(run.runDir);
+					// Crashed or killed children are archived so they can still be revived.
+					if (!run.suspended) archiveRunDir(run.runDir);
 					continue;
 				}
 				updateMetadata(run.runDir, { suspended: true });
