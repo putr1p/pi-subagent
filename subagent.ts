@@ -14,7 +14,10 @@ import {
 	listRuns,
 	readLatestAssistant,
 	readMetadata,
+	readOutbox,
+	removeOutboxEntries,
 	removeRunDir,
+	setMarker,
 	runDisplayName,
 	isValidRunName,
 	type InboxMessage,
@@ -41,6 +44,7 @@ function usage(): never {
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
   subagent wait <handle> [--timeout <seconds>]
+  subagent result <handle>
   subagent stop <handle>
   subagent list`);
 }
@@ -62,9 +66,20 @@ function runDirForHandle(handle: string): string {
 	return join(getRunsDir(), handle);
 }
 
+/**
+ * A Pi session may only manage subagents it spawned. Children (whose bash has their own PI_SESSION_ID)
+ * and plain terminals keep unrestricted access, as before.
+ */
+function callerMayManage(metadata: RunMetadata): boolean {
+	if (process.env.PI_SUBAGENT_RUN_DIR) return true;
+	const caller = process.env.PI_SESSION_ID;
+	return !caller || caller === metadata.parentSessionId;
+}
+
 function getRun(handle: string): RunMetadata {
 	const metadata = readMetadata(runDirForHandle(handle));
-	if (!metadata) fail(`Unknown subagent: ${handle}`);
+	// Another session's run is reported exactly like a missing one.
+	if (!metadata || !callerMayManage(metadata)) fail(`Unknown subagent: ${handle}`);
 	return metadata;
 }
 
@@ -200,7 +215,9 @@ function spawnSubagent(args: string[]): void {
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	process.stdout.write(
+		`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\nYou'll be notified when it finishes.\n`,
+	);
 }
 
 function statusSubagent(args: string[]): void {
@@ -274,6 +291,8 @@ async function waitSubagent(args: string[]): Promise<void> {
 		if (metadata.hasStarted && state === "idle" && !pending) {
 			const message = readLatestAssistant(metadata.sessionFile);
 			if (!message) fail(`${handle} finished without an assistant response`);
+			// The caller has the result now; don't also deliver it as a notification.
+			removeOutboxEntries(readOutbox(metadata.runDir));
 			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
 			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
 			return;
@@ -287,10 +306,33 @@ async function stopSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
 	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
+	// Mark the exit as intentional so neither the child nor the parent reports it.
+	setMarker(metadata.runDir, "stopping");
 	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
 	removeRunDir(metadata.runDir);
 	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+}
+
+/** Non-blocking: print the latest answer, or the run's current state if it has none to give. */
+function resultSubagent(args: string[]): void {
+	if (args.length !== 1) usage();
+	const handle = args[0];
+	const metadata = getRun(handle);
+	const state = effectiveRunState(metadata);
+	if (state === "error") fail(`${handle} failed: ${metadata.error || "unknown error"}`);
+	if (state === "exited") fail(`${handle} exited`);
+	const queueDir = inboxDir(metadata.runDir);
+	const pending = existsSync(queueDir) && readdirSync(queueDir).some((file) => file.endsWith(".json"));
+	if (!metadata.hasStarted || state !== "idle" || pending) {
+		process.stdout.write(`${handle} is still running\n`);
+		return;
+	}
+	const message = readLatestAssistant(metadata.sessionFile);
+	if (!message) fail(`${handle} finished without an assistant response`);
+	removeOutboxEntries(readOutbox(metadata.runDir));
+	process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
+	if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
 }
 
 function listSubagents(args: string[]): void {
@@ -325,6 +367,9 @@ async function main(): Promise<void> {
 			break;
 		case "wait":
 			await waitSubagent(args);
+			break;
+		case "result":
+			resultSubagent(args);
 			break;
 		case "stop":
 			await stopSubagent(args);

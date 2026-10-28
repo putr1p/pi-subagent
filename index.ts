@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 import {
+	assistantText,
 	effectiveRunState,
 	inboxDir,
 	launchRun,
@@ -17,9 +18,54 @@ import {
 	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
+	writeOutbox,
+	hasMarker,
+	setMarker,
+	clearMarker,
+	outcomeKind,
+	capResult,
+	readOutbox,
+	removeOutboxEntries,
+	clearExitedRecords,
+	type OutboxEntry,
+	type OutboxRecord,
 } from "./shared.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
+
+const RESULT_MESSAGE_TYPE = "subagent_result";
+/** A run still `starting` this long after its last metadata write, with no tmux session, has died. */
+const STARTING_GRACE_MS = 30_000;
+/** A child that has not started its first turn this long after spawn is reported once. */
+const NO_START_MS = 60_000;
+
+/** PI_SUBAGENT_NOTIFY=0 delivers results into the chat without starting a turn. */
+function notificationsTriggerTurn(): boolean {
+	const value = process.env.PI_SUBAGENT_NOTIFY?.trim().toLowerCase();
+	return !(value === "0" || value === "off" || value === "false" || value === "no");
+}
+
+function formatResult(record: OutboxRecord): string {
+	const label = record.name ? `${record.name} (${record.handle})` : record.handle;
+	const heading =
+		record.kind === "finished"
+			? `Subagent ${label} finished:`
+			: record.kind === "failed"
+				? `Subagent ${label} failed${record.stopReason ? ` (${record.stopReason})` : ""}:`
+				: `Subagent ${label} exited:`;
+	return `${heading}\n\n${capResult(record.text, record.handle)}`;
+}
+
+function contentText(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) =>
+			typeof block === "object" && block !== null && (block as { type?: unknown }).type === "text"
+				? String((block as { text?: unknown }).text ?? "")
+				: "",
+		)
+		.join("\n");
+}
 
 function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
@@ -146,6 +192,83 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		};
 
+		// ---- Result watcher: delivers outbox records of this session's children into the parent chat. ----
+		let watchTimer: ReturnType<typeof setInterval> | undefined;
+		let watchContext: ExtensionContext | undefined;
+		const triggerTurn = notificationsTriggerTurn();
+
+		const ageMs = (iso: string | undefined): number => (iso ? Date.now() - Date.parse(iso) : 0);
+
+		/** Reports the child cannot write itself: an unexpected death, or a child that never started. */
+		const writeParentReports = (run: RunMetadata): void => {
+			const state = effectiveRunState(run);
+			if (state === "exited") {
+				if (run.suspended || hasMarker(run.runDir, "stopping") || hasMarker(run.runDir, "reported-exit")) return;
+				// tmux is created right after metadata on spawn and relaunch; don't mistake that gap for a death.
+				if (run.state === "starting" && ageMs(run.updatedAt) < STARTING_GRACE_MS) return;
+				setMarker(run.runDir, "reported-exit");
+				writeOutbox(run.runDir, {
+					handle: run.handle,
+					name: run.name,
+					kind: "exited",
+					text: "The subagent process ended unexpectedly (crashed or was killed).",
+					at: new Date().toISOString(),
+				});
+				return;
+			}
+			if (!run.hasStarted && state !== "error" && ageMs(run.createdAt) > NO_START_MS) {
+				if (hasMarker(run.runDir, "reported-nostart")) return;
+				setMarker(run.runDir, "reported-nostart");
+				writeOutbox(run.runDir, {
+					handle: run.handle,
+					name: run.name,
+					kind: "failed",
+					text: `The subagent has not started after ${NO_START_MS / 1000} s. Check it with: tmux attach -t ${run.tmuxSession}`,
+					at: new Date().toISOString(),
+				});
+			}
+		};
+
+		const deliverResults = (): void => {
+			const ctx = watchContext;
+			if (!ctx) return;
+			try {
+				// Deliver while idle or mid-turn; skip while compacting (idle is false and no run is active).
+				if (!ctx.isIdle() && ctx.signal === undefined) return;
+				const entries: OutboxEntry[] = [];
+				for (const run of listRuns(ctx.sessionManager.getSessionId())) {
+					try {
+						writeParentReports(run);
+						entries.push(...readOutbox(run.runDir));
+					} catch {
+						// Run changing underneath us; retried next tick.
+					}
+				}
+				if (entries.length === 0) return;
+				const records = entries.map((entry) => entry.record);
+				pi.sendMessage(
+					{
+						customType: RESULT_MESSAGE_TYPE,
+						content: records.map(formatResult).join("\n\n---\n\n"),
+						display: true,
+						details: { results: records.map(({ handle, name, kind }) => ({ handle, name, kind })) },
+					},
+					triggerTurn ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
+				);
+				removeOutboxEntries(entries);
+			} catch {
+				// Never let a delivery problem escape the timer.
+			}
+		};
+
+		pi.registerMessageRenderer(RESULT_MESSAGE_TYPE, (message, options, theme) => {
+			const text = typeof message.content === "string" ? message.content : contentText(message.content);
+			const lines = text.split("\n");
+			const shown = options.expanded || lines.length <= 12 ? lines : [...lines.slice(0, 12), "…"];
+			const [first, ...rest] = shown;
+			return new Text([theme.fg("accent", first ?? ""), ...rest].join("\n"), 1, 0);
+		});
+
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
@@ -154,14 +277,32 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					removeRunDir(run.runDir);
 					continue;
 				}
+				// The suspend was intentional: drop its stop marker and any exit it produced.
+				clearMarker(run.runDir, "stopping");
+				clearMarker(run.runDir, "reported-exit");
+				clearExitedRecords(run.runDir);
 				const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
 				try {
 					launchRun(starting);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					updateMetadata(run.runDir, { state: "error", error: message });
+					writeOutbox(run.runDir, {
+						handle: run.handle,
+						name: run.name,
+						kind: "failed",
+						text: `Could not resume the subagent: ${message}`,
+						at: new Date().toISOString(),
+					});
 					if (ctx.hasUI) ctx.ui.notify(`Could not resume subagent ${runDisplayName(run)}: ${message}`, "error");
 				}
+			}
+
+			// The watcher runs in every mode (TUI, RPC, print); only the widget needs a UI.
+			watchContext = ctx;
+			if (!watchTimer) {
+				watchTimer = setInterval(deliverResults, 1000);
+				watchTimer.unref();
 			}
 
 			if (!ctx.hasUI) return;
@@ -172,6 +313,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		});
 
 		pi.on("session_shutdown", async (event, ctx) => {
+			if (watchTimer) clearInterval(watchTimer);
+			watchTimer = undefined;
+			watchContext = undefined;
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
 			widgetContext = undefined;
@@ -185,6 +329,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					continue;
 				}
 				updateMetadata(run.runDir, { suspended: true });
+				// Marker file too: the child may overwrite metadata concurrently and drop `suspended`.
+				setMarker(run.runDir, "stopping");
 				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
 				await waitForRunShutdown(run.runDir);
 			}
@@ -206,6 +352,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		sessionName = next;
 	};
 
+	// Set once a message has been handed to an idle child and cleared on agent_start. While set, the
+	// child is about to start a run but still reports idle, so no further message may be sent as a new
+	// prompt: Pi would start a second run and drop it.
+	// Expires after 15 s: if Pi rejects the prompt internally (e.g. auth failure), agent_start never fires.
+	let promptPendingSince: number | undefined;
+	const PROMPT_PENDING_MS = 15_000;
+
 	const processInbox = async (): Promise<void> => {
 		if (processing || !currentContext) return;
 		syncSessionName();
@@ -216,6 +369,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			for (const name of readdirSync(queueDir)
 				.filter((entry) => entry.endsWith(".json"))
 				.sort()) {
+				const idle = currentContext.isIdle();
+				// Idle child: send exactly one message, then wait for agent_start before the next.
+				if (idle && promptPendingSince !== undefined && Date.now() - promptPendingSince < PROMPT_PENDING_MS) return;
 				const path = join(queueDir, name);
 				let payload: InboxMessage;
 				try {
@@ -233,7 +389,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 				updateMetadata(runDir, { state: "busy", error: undefined });
 				try {
-					if (currentContext.isIdle()) {
+					if (idle) {
+						promptPendingSince = Date.now();
 						pi.sendUserMessage(payload.message);
 					} else {
 						pi.sendUserMessage(payload.message, {
@@ -242,16 +399,29 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					}
 					unlinkSync(path);
 				} catch (error) {
+					promptPendingSince = undefined;
 					updateMetadata(runDir, {
 						state: currentContext.isIdle() ? "idle" : "busy",
 						error: error instanceof Error ? error.message : String(error),
 					});
 					return;
 				}
+				if (idle) return;
 			}
 		} finally {
 			processing = false;
 		}
+	};
+
+	const lastAssistant = (ctx: ExtensionContext): { text: string; stopReason?: string } | undefined => {
+		const branch = ctx.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const message = entry.message as Parameters<typeof assistantText>[0] & { stopReason?: string };
+			return { text: assistantText(message), stopReason: message.stopReason };
+		}
+		return undefined;
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -275,12 +445,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_start", (_event, ctx) => {
 		currentContext = ctx;
+		promptPendingSince = undefined;
 		updateMetadata(runDir, { state: "busy", hasStarted: true, error: undefined });
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		currentContext = ctx;
-		if (ctx.isIdle()) updateMetadata(runDir, { state: "idle" });
+		if (!ctx.isIdle()) return;
+		const metadata = updateMetadata(runDir, { state: "idle" });
+		const last = lastAssistant(ctx);
+		if (!metadata || !last) return;
+		writeOutbox(runDir, {
+			handle: metadata.handle,
+			name: metadata.name,
+			kind: outcomeKind(last.stopReason),
+			stopReason: last.stopReason,
+			text: last.text,
+			at: new Date().toISOString(),
+		});
 	});
 
 	pi.on("session_shutdown", (event) => {
@@ -289,6 +471,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			clearInterval(timer);
 			timer = undefined;
 		}
-		if (event.reason === "quit") updateMetadata(runDir, { state: "exited" });
+		if (event.reason !== "quit") return;
+		const metadata = updateMetadata(runDir, { state: "exited" });
+		// Intentional stop or suspend: nothing to report.
+		if (!metadata || hasMarker(runDir, "stopping")) return;
+		writeOutbox(runDir, {
+			handle: metadata.handle,
+			name: metadata.name,
+			kind: "exited",
+			text: "The subagent quit.",
+			at: new Date().toISOString(),
+		});
+		// The parent must not report this exit a second time.
+		setMarker(runDir, "reported-exit");
 	});
 }

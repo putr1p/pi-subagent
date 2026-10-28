@@ -53,19 +53,21 @@ Three additional built-in tools are available but off by default:
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
 
-Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
+Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. Subagents persist after their current turn completes: completion and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
 
-## Inspect and wait
+## Results
+
+Subagents run in the background. **Do not call `subagent wait`**: it blocks you until the subagent finishes, and the user cannot talk to you meanwhile.
+
+After `spawn` (or `send`), hand control back: continue with other work or end your turn. When the subagent finishes, fails, or exits, its result arrives automatically as a `subagent_result` message. Respond to it then.
 
 ```sh
+subagent result <handle>   # non-blocking: latest answer, or "still running"
 subagent status <handle>
 subagent list
-subagent wait <handle>
 ```
 
-Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
-
-`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+Run `subagent list` at any time to rediscover your active subagents and their handles, names, and current states. Run `result` and `status` directly; do not pipe or redirect their output. Do not infer completion from captured terminal text.
 
 ## Communicate
 
@@ -79,6 +81,8 @@ subagent send <handle> "message"
 # Busy: waits until current work finishes, then starts another turn.
 subagent send <handle> --follow-up "message"
 ```
+
+The answer to a sent message arrives as a `subagent_result` message, like the first one.
 
 Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`.
 

@@ -63,10 +63,28 @@ subagent status a1b2c3
 subagent rename a1b2c3 "error handling review"
 subagent send a1b2c3 "Focus on error handling"
 subagent send a1b2c3 --follow-up "Then summarize"
+subagent result a1b2c3
 subagent wait a1b2c3
 subagent stop a1b2c3
 subagent list
 ```
+
+## Results
+
+Subagents never block the parent. When a child finishes a turn, fails, or exits unexpectedly, its result is injected into the parent session as a `subagent_result` message: an idle parent starts a new turn, a busy one receives it after its current turn. Results found in the same second arrive as one message.
+
+- The child writes each result to `outbox/` in its run directory; the parent extension delivers and deletes it. Results produced while the parent is suspended are delivered when it resumes.
+- The parent also reports a child that died without saying so, and one that has not started 60 s after spawn.
+- `stop` and parent suspension are not reported.
+- Results over 8 KB are cut; `subagent result <handle>` prints the full answer without blocking.
+- `subagent wait` still blocks, for scripts and terminals. A result it returns is not also notified.
+- Delivery is best effort: a parent crash at the wrong moment can duplicate a result or, rarely, lose one.
+- `PI_SUBAGENT_NOTIFY=0` in the parent's environment shows results in the chat without starting a turn.
+- Results from turns you run yourself in an attached child are delivered too. With several follow-ups queued, only the final answer is reported.
+
+## Ownership
+
+Inside a Pi session, `status`, `send`, `wait`, `result`, `rename`, and `stop` only act on subagents spawned by that session; other handles are reported as unknown. Plain terminals, `!` commands, and subagents themselves keep unrestricted access. After `/new` or `/fork`, the previous session's subagents can be managed from a plain terminal.
 
 Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
 

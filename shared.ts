@@ -117,6 +117,11 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 
 export function writeMetadata(metadata: RunMetadata): void {
 	mkdirSync(dirname(metadataPath(metadata.runDir)), { recursive: true, mode: 0o700 });
+	writeMetadataFile(metadata);
+}
+
+/** Replace metadata of an existing run. Never recreates a run directory that `stop` already removed. */
+function writeMetadataFile(metadata: RunMetadata): void {
 	const target = metadataPath(metadata.runDir);
 	const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
 	writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -134,7 +139,11 @@ export function updateMetadata(runDir: string, patch: Partial<RunMetadata>): Run
 		runDir: current.runDir,
 		updatedAt: new Date().toISOString(),
 	};
-	writeMetadata(next);
+	try {
+		writeMetadataFile(next);
+	} catch {
+		return undefined; // Run directory removed concurrently.
+	}
 	return next;
 }
 
@@ -280,4 +289,125 @@ export function assistantText(message: AssistantMessage): string {
 		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
 	}
 	return parts.join("\n").trim() || message.errorMessage || "(no response text)";
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Outbox: results flowing from a child (or the parent on its behalf) to the parent session.
+
+export type OutboxKind = "finished" | "failed" | "exited";
+
+export interface OutboxRecord {
+	handle: string;
+	name?: string;
+	kind: OutboxKind;
+	stopReason?: string;
+	text: string;
+	at: string;
+}
+
+export function outboxDir(runDir: string): string {
+	return join(runDir, "outbox");
+}
+
+let outboxSeq = 0;
+
+/** Append a record. Returns false if the run directory no longer exists; never recreates it. */
+export function writeOutbox(runDir: string, record: OutboxRecord): boolean {
+	if (!existsSync(runDir)) return false;
+	try {
+		const dir = outboxDir(runDir);
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const ts = String(Date.now()).padStart(15, "0");
+		const seq = String(outboxSeq++ % 1_000_000).padStart(6, "0");
+		const target = join(dir, `${ts}-${seq}-${process.pid}.json`);
+		const temporary = `${target}.tmp`;
+		writeFileSync(temporary, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+		renameSync(temporary, target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export interface OutboxEntry {
+	path: string;
+	record: OutboxRecord;
+}
+
+function isOutboxRecord(value: unknown): value is OutboxRecord {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		typeof record.handle === "string" &&
+		typeof record.text === "string" &&
+		(record.kind === "finished" || record.kind === "failed" || record.kind === "exited")
+	);
+}
+
+/** Records in delivery order. Unreadable files are removed. Never throws. */
+export function readOutbox(runDir: string): OutboxEntry[] {
+	let names: string[];
+	try {
+		names = readdirSync(outboxDir(runDir))
+			.filter((name) => name.endsWith(".json"))
+			.sort();
+	} catch {
+		return [];
+	}
+	const entries: OutboxEntry[] = [];
+	for (const name of names) {
+		const path = join(outboxDir(runDir), name);
+		try {
+			const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+			if (isOutboxRecord(value)) entries.push({ path, record: value });
+			else rmSync(path, { force: true });
+		} catch {
+			// Vanished or partially visible; skip this tick.
+		}
+	}
+	return entries;
+}
+
+export function removeOutboxEntries(entries: OutboxEntry[]): void {
+	for (const entry of entries) rmSync(entry.path, { force: true });
+}
+
+/** Remove pending `exited` records (used on resume, where the exit was an intentional suspend). */
+export function clearExitedRecords(runDir: string): void {
+	removeOutboxEntries(readOutbox(runDir).filter((entry) => entry.record.kind === "exited"));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Marker files. Kept outside metadata.json, which parent, child and CLI all rewrite concurrently.
+
+export type Marker = "stopping" | "reported-exit" | "reported-nostart";
+
+export function hasMarker(runDir: string, marker: Marker): boolean {
+	return existsSync(join(runDir, marker));
+}
+
+export function setMarker(runDir: string, marker: Marker): void {
+	if (!existsSync(runDir)) return;
+	try {
+		writeFileSync(join(runDir, marker), "", { mode: 0o600 });
+	} catch {
+		// Run removed concurrently.
+	}
+}
+
+export function clearMarker(runDir: string, marker: Marker): void {
+	rmSync(join(runDir, marker), { force: true });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+
+export const MAX_RESULT_CHARS = 8_000;
+
+export function capResult(text: string, handle: string): string {
+	if (text.length <= MAX_RESULT_CHARS) return text;
+	return `${text.slice(0, MAX_RESULT_CHARS)}\n\n[truncated; full answer: subagent result ${handle}]`;
+}
+
+export function outcomeKind(stopReason: string | undefined): "finished" | "failed" {
+	return stopReason === "error" || stopReason === "aborted" ? "failed" : "finished";
 }
