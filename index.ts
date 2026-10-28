@@ -479,7 +479,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			handle: metadata.handle,
 			name: metadata.name,
 			kind: "exited",
-			text: "The subagent quit.",
+			text: "The subagent process ended (it quit, or its tmux session was killed).",
 			at: new Date().toISOString(),
 		});
 		// The parent must not report this exit a second time.
